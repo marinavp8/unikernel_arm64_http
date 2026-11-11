@@ -1,0 +1,450 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Unikernel ARM64 HTTP — explicación</title>
+<style>
+  :root {
+    --bg: #fafaf7; --fg: #1d1d1b; --muted: #6b6b66; --card: #ffffff;
+    --line: #e4e2dc; --accent: #0b7a5c; --code-bg: #f1f0ea; --warn: #9a5b00;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #141414; --fg: #e9e9e4; --muted: #9a9a94; --card: #1d1d1c;
+      --line: #2e2e2b; --accent: #4fd1a5; --code-bg: #232321; --warn: #e0a84a;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #141414; --fg: #e9e9e4; --muted: #9a9a94; --card: #1d1d1c;
+    --line: #2e2e2b; --accent: #4fd1a5; --code-bg: #232321; --warn: #e0a84a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+  main { max-width: 860px; margin: 0 auto; padding: 32px 16px 64px; }
+  h1 { font-size: 2rem; margin: 0 0 4px; }
+  h2 { font-size: 1.4rem; margin: 48px 0 12px; padding-top: 16px; border-top: 1px solid var(--line); }
+  h3 { font-size: 1.05rem; margin: 24px 0 8px; }
+  p, li { margin: 8px 0; }
+  .sub { color: var(--muted); margin-top: 0; }
+  nav { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px 18px; margin: 24px 0; }
+  nav ol { margin: 0; padding-left: 20px; columns: 2; }
+  nav a { color: var(--accent); text-decoration: none; }
+  a { color: var(--accent); }
+  code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.9em; }
+  code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+  pre { background: var(--code-bg); padding: 14px 16px; border-radius: 8px; overflow-x: auto; line-height: 1.45; }
+  pre code { background: none; padding: 0; }
+  table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 0.95em; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px 18px; margin: 14px 0; }
+  .tip { border-left: 4px solid var(--accent); }
+  .warn { border-left: 4px solid var(--warn); }
+  .flow { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 14px 0; }
+  .flow span { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; font-size: 0.92em; }
+  .flow b { color: var(--accent); }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .state { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 12px 0; font-size: 0.9em; }
+  .state code { font-weight: 600; }
+  @media (max-width: 640px) { nav ol { columns: 1; } .grid { grid-template-columns: 1fr; } h1 { font-size: 1.6rem; } table { font-size: 0.88em; } }
+</style>
+</head>
+<body>
+<main>
+
+<h1>Unikernel ARM64 con servidor HTTP</h1>
+<p class="sub">Un programa en C que arranca directamente sobre una máquina virtual ARM64 emulada por QEMU, sin sistema operativo, responde a peticiones HTTP en el puerto 18080 y, en la ruta <code>/remote</code>, consulta otro servicio HTTP y devuelve su respuesta.</p>
+
+<nav>
+  <strong>Índice</strong>
+  <ol>
+    <li><a href="#que">Qué es un unikernel</a></li>
+    <li><a href="#arquitectura">Arquitectura general</a></li>
+    <li><a href="#qemu">Relación con QEMU</a></li>
+    <li><a href="#mapa-memoria">Mapa de memoria</a></li>
+    <li><a href="#codigo">Mapa del código</a></li>
+    <li><a href="#flujo">Flujo de una petición</a></li>
+    <li><a href="#remote">Cliente saliente: <code>/remote</code></a></li>
+    <li><a href="#arranque">Arranque y enlazado</a></li>
+    <li><a href="#bugs">Problemas resueltos</a></li>
+    <li><a href="#mac">Herramientas en macOS</a></li>
+    <li><a href="#ejecucion">Ejecución: hypervisor vs TCG</a></li>
+    <li><a href="#probar">Cómo ejecutarlo y probarlo</a></li>
+    <li><a href="#problemas">Solución de problemas</a></li>
+    <li><a href="#pendiente">Pendiente</a></li>
+    <li><a href="#rendimiento">Rendimiento medido</a></li>
+    <li><a href="#notas">Limitaciones</a></li>
+  </ol>
+</nav>
+
+<h2 id="que">1. Qué es un unikernel</h2>
+<p>Un <strong>unikernel</strong> es un programa que incluye solo lo que necesita para funcionar y se ejecuta directamente sobre el hardware (o una máquina virtual) sin un sistema operativo de propósito general. Aquí no hay Linux, ni drivers genéricos, ni procesos, ni libc: el propio código inicializa el procesador, la UART (consola) y la tarjeta de red, y atiende el tráfico TCP/HTTP.</p>
+<p>El proyecto implementa todo eso en unos pocos archivos:</p>
+<ul>
+  <li>Un driver mínimo de <strong>VirtIO-Net</strong> (tarjeta de red virtual) por MMIO, en modo <em>legacy</em> (versión 1).</li>
+  <li>Una pila de red propia: <strong>Ethernet, ARP, IPv4, TCP</strong> y un HTTP de una sola respuesta.</li>
+  <li>Un cliente HTTP saliente muy simple, usado solo por <code>/remote</code>.</li>
+  <li>Un bucle de <strong>polling</strong>: no usa interrupciones, consulta constantemente la cola de recepción.</li>
+</ul>
+
+<h2 id="arquitectura">2. Arquitectura general</h2>
+<p>El sistema tiene tres capas: el <strong>Mac</strong> (host), <strong>QEMU</strong> (la máquina virtual y su red de usuario) y el <strong>unikernel</strong> (el código de <code>kernel.c</code>) que corre dentro de esa máquina.</p>
+
+<h3>Petición directa</h3>
+<div class="flow">
+  <span>Cliente <b>curl</b> en el Mac</span>
+  <span>→ puerto <b>18080</b> del host</span>
+  <span>→ QEMU <b>hostfwd</b></span>
+  <span>→ VirtIO-Net</span>
+  <span>→ pila TCP/IP en C</span>
+  <span>→ respuesta HTTP 200</span>
+</div>
+
+<h3>Petición <code>/remote</code></h3>
+<div class="flow">
+  <span>Cliente <b>curl</b> en el Mac</span>
+  <span>→ <b>18080</b> → QEMU → unikernel</span>
+  <span>→ unikernel abre TCP a <b>10.0.2.2:9000</b></span>
+  <span>→ QEMU/SLIRP reenvía al Mac</span>
+  <span>→ servicio del Mac responde</span>
+  <span>→ unikernel devuelve ese cuerpo al cliente</span>
+</div>
+
+<div class="grid">
+  <div class="card">
+    <h3>Máquina virtual</h3>
+    <p>QEMU emula la placa <code>virt</code> de ARM: CPU, RAM, UART PL011 y dispositivos VirtIO por MMIO. El unikernel habla con esos dispositivos escribiendo en direcciones de memoria concretas.</p>
+  </div>
+  <div class="card">
+    <h3>Red de usuario (SLIRP)</h3>
+    <p>QEMU actúa como router NAT. El unikernel tiene la IP <code>10.0.2.15</code>, la puerta de enlace es <code>10.0.2.2</code> (el propio Mac) y el puerto 18080 del Mac se reenvía al del unikernel.</p>
+  </div>
+</div>
+
+<h2 id="qemu">3. Relación con QEMU</h2>
+<p>QEMU no ejecuta el sistema operativo ni la red: <strong>simula el hardware</strong> que el unikernel espera encontrar. Todo lo que el código escribe en una dirección fija llega a un dispositivo simulado por QEMU. Esta sección enlaza cada pieza del hardware simulado con el código que la usa.</p>
+
+<h3>Qué simula QEMU y dónde lo usa el código</h3>
+<table>
+  <tr><th>Elemento simulado</th><th>Dirección / configuración</th><th>Quién lo usa en el proyecto</th></tr>
+  <tr><td><strong>Máquina <code>virt</code></strong></td><td><code>-M virt</code>: placa genérica ARM con mapa de memoria fijo</td><td>Las direcciones de <code>kernel.c</code> y <code>linker.ld</code> dependen de esta placa.</td></tr>
+  <tr><td><strong>CPU</strong></td><td><code>-cpu host -accel hvf</code> en Apple Silicon, o <code>-cpu cortex-a72 -accel tcg</code> en otros casos</td><td><code>boot.s</code> (núcleo 0, FP/SIMD, pila). El código corre en EL1 porque la placa <code>virt</code> por defecto no expone EL2.</td></tr>
+  <tr><td><strong>RAM</strong></td><td><code>-m 128M</code>, empieza en <code>0x40000000</code></td><td>El binario se carga en <code>0x40080000</code>; la pila crece hacia abajo desde ahí.</td></tr>
+  <tr><td><strong>UART PL011</strong></td><td>Registro de datos en <code>0x09000000</code></td><td><code>uart_putc</code> escribe ahí. Con <code>-nographic</code>, QEMU conecta esa UART a la terminal donde corre el script.</td></tr>
+  <tr><td><strong>Bus VirtIO-MMIO</strong></td><td>32 ranuras desde <code>0x0a000000</code>, cada una de <code>0x200</code> bytes</td><td><code>virtio_net_init</code> recorre las ranuras buscando magic <code>'virt'</code> y device ID 1. QEMU colocó la tarjeta en <code>0x0a003e00</code> (ranura 31), como muestra la consola.</td></tr>
+  <tr><td><strong>Tarjeta de red VirtIO</strong></td><td><code>-device virtio-net-device,netdev=net0</code></td><td>Todo el driver de <code>kernel.c</code> (colas RX/TX, anillos <code>avail</code>/<code>used</code>, notificaciones).</td></tr>
+  <tr><td><strong>Modo legacy VirtIO</strong></td><td><code>-global virtio-mmio.force-legacy=on</code></td><td>El driver usa los registros de la versión 1 (<code>GUEST_PAGE</code>, <code>QUEUE_PFN</code>, <code>QUEUE_ALIGN</code>). Sin esta opción, QEMU presentaría la versión 2 y el driver no funcionaría.</td></tr>
+  <tr><td><strong>Red de usuario (SLIRP)</strong></td><td><code>-netdev user,id=net0,hostfwd=tcp::18080-:18080</code></td><td>QEMU implementa en software una pila NAT: entrega ARP y TCP del guest, y convierte las conexiones salientes en sockets reales del Mac.</td></tr>
+  <tr><td><strong>Cargador de kernel</strong></td><td><code>-kernel unikernel_http.elf</code></td><td>QEMU lee las cabeceras ELF, copia cada segmento a su dirección física y salta a la <em>entry point</em> (<code>_start</code>, <code>0x40080000</code>).</td></tr>
+</table>
+
+<h3>Qué hace QEMU en cada paso de una petición</h3>
+<ol>
+  <li><strong>Host → guest:</strong> <code>curl</code> conecta a <code>localhost:18080</code> del Mac. SLIRP recibe el paquete por <code>hostfwd</code>, construye un frame Ethernet con destino <code>10.0.2.15</code> y lo deposita en un descriptor del anillo RX de la tarjeta virtual.</li>
+  <li><strong>Notificación:</strong> el unikernel escribe el índice de cola en <code>QUEUE_NOTIFY</code> y QEMU sabe que hay trabajo; el polling del unikernel ve avanzar <code>used.idx</code>.</li>
+  <li><strong>Respuesta:</strong> cuando <code>tcp_tx</code> o <code>virtio_net_send</code> escribe en el anillo TX y notifica a QEMU, SLIRP toma el frame, reconstruye el paquete TCP/IP y lo entrega al socket del Mac.</li>
+  <li><strong>Gateway:</strong> las consultas ARP a <code>10.0.2.2</code> las responde QEMU. Esa IP no es una máquina real: es el propio Mac visto desde la red de usuario.</li>
+</ol>
+
+<div class="card tip">
+  <strong>Por qué <code>10.0.2.2:9000</code> llega al Mac.</strong> SLIRP reserva <code>10.0.2.2</code> como alias del host. Un unikernel que conecta a <code>10.0.2.2:9000</code> abre en realidad un socket TCP hacia el puerto 9000 del Mac. Por eso el servicio de prueba de <code>/remote</code> se ejecuta en el Mac, no dentro del unikernel.
+</div>
+
+<h3>Qué tiene que hacer el unikernel (y QEMU no hace)</h3>
+<ul>
+  <li>Inicializar el dispositivo VirtIO: reset, handshake de estado, negociación de features y configuración de colas.</li>
+  <li>Construir y leer frames Ethernet, ARP, IPv4 y TCP con sus checksums. QEMU no hace de servidor TCP por el guest.</li>
+  <li>Mantener el estado de cada conexión TCP (secuencia, ACK, puertos).</li>
+  <li>Configurar el procesador: FP/SIMD, pila y BSS (ver sección 8).</li>
+</ul>
+
+<h2 id="mapa-memoria">4. Mapa de memoria</h2>
+<p>Direcciones reales del binario compilado, obtenidas con <code>aarch64-elf-nm</code> y <code>aarch64-elf-readelf</code>:</p>
+<table>
+  <tr><th>Dirección</th><th>Contenido</th></tr>
+  <tr><td><code>0x09000000</code></td><td>UART PL011 (E/S de consola, sin RAM)</td></tr>
+  <tr><td><code>0x0a000000 … 0x0a003fff</code></td><td>Ranuras VirtIO-MMIO (32 × <code>0x200</code>). La tarjeta de red está en <code>0x0a003e00</code></td></tr>
+  <tr><td><code>0x40000000</code></td><td>Inicio de la RAM de la VM (<code>-m 128M</code>)</td></tr>
+  <tr><td><code>0x40080000</code></td><td><code>_start</code>: entrada del ELF, cabecera de <code>.text</code>, y la pila empieza aquí y crece hacia abajo</td></tr>
+  <tr><td><code>0x40083ab0</code></td><td><code>kernel_main</code></td></tr>
+  <tr><td><code>0x40085000 … 0x40093000</code></td><td>BSS (<code>__bss_start</code> … <code>__bss_end</code>): variables globales a cero, buffers de red, anillos VirtIO</td></tr>
+  <tr><td><code>0x4008f000</code></td><td><code>tx_vq</code>: anillos de la cola TX (alineado a 4 KiB)</td></tr>
+  <tr><td><code>0x40091000</code></td><td><code>rx_vq</code>: anillos de la cola RX (alineado a 4 KiB)</td></tr>
+  <tr><td><code>0x40085800</code>, <code>0x40085e40</code>, <code>0x40086e40</code></td><td><code>reply_frame</code> (frames de salida), <code>up_buf</code> (respuesta del upstream), <code>rx_buffers</code> (16 × 2048 bytes)</td></tr>
+</table>
+<p>El ELF tiene un único segmento <code>LOAD</code> con permisos <code>RWE</code>, por eso el enlazador avisa de RWX (sección 13).</p>
+
+<h2 id="codigo">5. Mapa del código</h2>
+<table>
+  <tr><th>Archivo</th><th>Qué hace</th></tr>
+  <tr><td><code>boot.s</code></td><td>Punto de entrada en ensamblador. Comprueba el núcleo, activa FP/SIMD, pone la pila, limpia la BSS y salta a <code>kernel_main</code>. Los núcleos secundarios se quedan en <code>wfe</code>.</td></tr>
+  <tr><td><code>linker.ld</code></td><td>Coloca el código en <code>0x40080000</code>, define <code>.text</code>, <code>.rodata</code>, <code>.data</code> y <code>.bss</code> alineado a 4 KiB.</td></tr>
+  <tr><td><code>kernel.c</code></td><td>Todo el sistema: UART, utilidades de memoria, driver VirtIO-Net, pila de red, HTTP entrante, cliente HTTP saliente y el bucle principal.</td></tr>
+  <tr><td><code>build_and_run.sh</code></td><td>Instala herramientas si faltan, compila, enlaza y lanza QEMU con la red y el reenvío de puertos.</td></tr>
+  <tr><td><code>unikernel_http.elf</code></td><td>Binario final que QEMU carga con <code>-kernel</code>.</td></tr>
+  <tr><td><code>explicacion.html</code></td><td>Este documento.</td></tr>
+</table>
+
+<h3>Secciones de <code>kernel.c</code></h3>
+<ol>
+  <li><strong>UART PL011</strong> (líneas 5–26): escribir un byte en <code>0x09000000</code> es enviarlo a la consola. No hace falta esperar al registro de estado.</li>
+  <li><strong>Utilidades</strong> (líneas 28–60): <code>memcpy</code>, <code>memset</code>, <code>memcmp</code> propias (sin libc) y <code>htons/ntohs/htonl/ntohl</code>, porque la red va en big-endian.</li>
+  <li><strong>VirtIO-Net</strong> (líneas 62–257): constantes de registros legacy, estructuras de virtqueue, <code>virtio_net_init</code> (línea 167) y <code>virtio_net_send</code> (línea 232).</li>
+  <li><strong>Pila de red</strong> (líneas 258–404): estructuras Ethernet/ARP/IPv4/TCP, <code>checksum</code> y <code>tcp_checksum</code>, la respuesta fija <code>http_payload</code> (línea 351) y <code>send_tcp_packet</code> (línea 362).</li>
+  <li><strong>Cliente saliente</strong> (líneas 405–690): constantes del upstream, <code>tcp_tx</code> genérico, envío de la respuesta por trozos, ARP, máquina de estados del cliente y <code>outbound_rx</code>.</li>
+  <li><strong><code>handle_packet</code></strong> (línea 601): separa ARP, segmentos del upstream y segmentos del cliente en el puerto 18080.</li>
+  <li><strong><code>kernel_main</code></strong> (línea 694): imprime el banner, inicializa la red y entra en el bucle de polling, que también gestiona el timeout del upstream.</li>
+</ol>
+
+<div class="card tip">
+  <strong>Respuesta HTTP.</strong> El contenido está fijo en <code>http_payload</code>: un HTML con el texto "Unikernel ARM64 Bare-Metal" y <code>Content-Length: 175</code>. No hay parser de peticiones: cualquier payload recibido en el puerto 18080 recibe la misma respuesta <code>200 OK</code>, <strong>salvo</strong> que empiece por <code>GET /remote </code>, que activa el cliente saliente.
+</div>
+
+<h2 id="flujo">6. Flujo de una petición directa</h2>
+<ol>
+  <li><code>curl http://localhost:18080</code> abre TCP al host; QEMU reenvía el paquete al guest.</li>
+  <li>El bucle de polling detecta un nuevo elemento en <code>rx_vq.used</code> y llama a <code>handle_packet</code>.</li>
+  <li>Se comprueba que el paquete es IPv4, TCP, destinado a <code>10.0.2.15</code> y al puerto 18080.</li>
+  <li><strong>SYN</strong> → se responde <code>SYN+ACK</code>. El cliente envía <strong>ACK</strong> y después <strong>PSH</strong> con la petición.</li>
+  <li>Con datos entrantes que no son <code>GET /remote</code>, se envía un único segmento <code>PSH+ACK+FIN</code> con el HTML.</li>
+  <li>Si el cliente envía <strong>FIN</strong>, se responde con <strong>ACK</strong>.</li>
+  <li>El buffer RX se devuelve al anillo <code>avail</code> y se notifica a QEMU para la siguiente recepción.</li>
+</ol>
+
+<h2 id="remote">7. Cliente saliente: <code>GET /remote</code></h2>
+<p>Cuando la petición empieza por <code>GET /remote </code>, el unikernel actúa también como <strong>cliente HTTP</strong>: abre una conexión TCP al upstream, espera la respuesta y la reenvía al cliente original.</p>
+
+<h3>Estados de la conexión saliente</h3>
+<div class="state">
+  <code>OUT_IDLE</code> → <code>OUT_ARP</code> (si falta la MAC del gateway) → <code>OUT_SYN</code> → <code>OUT_WAIT_DATA</code> → vuelta a <code>OUT_IDLE</code>
+</div>
+<table>
+  <tr><th>Paso</th><th>Qué ocurre</th><th>Función</th></tr>
+  <tr><td>1</td><td>Llega <code>GET /remote</code>. Se guarda la MAC, IP y puerto del cliente y se responde <code>ACK</code> al cliente.</td><td><code>handle_packet</code></td></tr>
+  <tr><td>2</td><td>Se incrementa el número de conexión, se elige puerto local <code>40000 + n</code> e ISN <code>5000 + n·1000</code>. Cada conexión usa puerto e ISN nuevos porque SLIRP conserva el estado de la anterior.</td><td><code>outbound_start</code></td></tr>
+  <tr><td>3</td><td>Si la MAC del gateway <code>10.0.2.2</code> es desconocida, se envía un ARP request y se espera la respuesta.</td><td><code>send_arp_request</code></td></tr>
+  <tr><td>4</td><td>Se envía el <strong>SYN</strong> a <code>10.0.2.2:9000</code>. Al recibir <code>SYN+ACK</code>, se envía el <strong>ACK</strong> y la petición <code>GET / HTTP/1.1</code> en el mismo segmento.</td><td><code>outbound_send_syn</code>, <code>outbound_rx</code></td></tr>
+  <tr><td>5</td><td>Cada segmento de datos se copia en <code>up_buf</code> (4096 bytes) y se confirma con ACK. Los segmentos fuera de orden se descartan confirmando lo que ya se tiene.</td><td><code>outbound_rx</code></td></tr>
+  <tr><td>6</td><td>Con <strong>FIN</strong> del upstream, se cierra el lado saliente y se envía la respuesta al cliente en trozos de 1200 bytes; el último lleva <strong>FIN</strong>.</td><td><code>outbound_finish</code>, <code>send_client_response</code></td></tr>
+  <tr><td>7</td><td>Si no llega respuesta en <code>OUT_TIMEOUT_TICKS</code> iteraciones de polling (50 000 000), se envía al cliente <code>504 Gateway Timeout</code>.</td><td><code>kernel_main</code></td></tr>
+</table>
+
+<h3>Logs esperados en la consola</h3>
+<pre><code>[HTTP] GET /remote -> consultando upstream
+[OUT] Conectando a http://10.0.2.2:9000/
+[OUT] Gateway 10.0.2.2 resuelto por ARP
+[OUT] Respuesta recibida: 1234 bytes -> reenviando al cliente</code></pre>
+<p>Si el upstream no responde aparece <code>[OUT] Timeout esperando al upstream -> 504</code>. El número de iteraciones de polling no equivale a un tiempo exacto; depende de la velocidad del host.</p>
+
+<div class="card warn">
+  <strong>Destino fijo.</strong> La URL del upstream está escrita en el código como <code>10.0.2.2:9000</code> (IP en <code>gw_ip</code>, puerto en <code>UPSTREAM_PORT</code>, cabecera <code>Host</code> en <code>upstream_req</code>). Cambiarla a una URL externa requiere parametrizar esos tres valores y que la IP destino sea alcanzable a través de SLIRP. Ver sección 14.
+</div>
+
+<h2 id="arranque">8. Arranque y enlazado</h2>
+<ul>
+  <li><code>boot.s</code> ejecuta <code>mrs x1, mpidr_el1</code> para comprobar el núcleo: solo el núcleo 0 continúa, el resto entra en <code>wfe</code>. La VM se lanza con un único núcleo por defecto.</li>
+  <li>QEMU con <code>-kernel</code> salta a <code>_start</code> en EL1. Se configura <code>CPACR_EL1</code> para FP/SIMD antes de cualquier código generado por el compilador que los use.</li>
+  <li>La pila empieza en <code>_start</code> (<code>0x40080000</code>) y crece hacia abajo, hacia la RAM libre por debajo del código.</li>
+  <li>La BSS se pone a cero. Es necesario porque los anillos VirtIO y los buffers de red están ahí y deben empezar limpios.</li>
+  <li><code>linker.ld</code> alinea <code>rx_vq</code> y <code>tx_vq</code> a 4 KiB, requisito de VirtIO legacy para <code>QUEUE_PFN</code> (dirección del anillo dividida entre 4096).</li>
+</ul>
+
+<h2 id="bugs">9. Problemas resueltos durante la puesta en marcha</h2>
+<p>El unikernel escribía <code>[NET] VirtIO-Net encontrado</code> y después se quedaba colgado. Se encontraron dos causas y una tercera de configuración:</p>
+
+<div class="card warn">
+  <h3>a) FP/SIMD deshabilitado → Undefined Instruction</h3>
+  <p><strong>Síntoma:</strong> excepción con <code>ESR EC=0x07</code> en <code>ldr q30, [x19, #16]</code>.<br>
+  <strong>Causa:</strong> <code>-O3</code> genera instrucciones NEON para copiar datos, pero el núcleo no habilita el acceso a FP/SIMD. Cada instrucción trapea y el vector de excepciones (vacío) vuelve a fallar en bucle.<br>
+  <strong>Solución:</strong> en <code>boot.s</code>, antes de llamar a C: <code>mov x0, #(3 &lt;&lt; 20); msr cpacr_el1, x0; isb</code>.</p>
+</div>
+
+<div class="card warn">
+  <h3>b) Acceso no alineado en memoria Device → Data Abort</h3>
+  <p><strong>Síntoma:</strong> <code>Data Abort</code> con <code>DFSC 0x21</code> (alignment fault) al escribir en <code>0x4008d104</code> con <code>stur q31</code>.<br>
+  <strong>Causa:</strong> sin MMU activa, QEMU trata la memoria como <em>Device-nGnRnE</em>, donde todo acceso no alineado a su tamaño falla. El compilador genera esos accesos al copiar estructuras empaquetadas de la pila de red.<br>
+  <strong>Solución:</strong> <code>-mstrict-align</code> en la compilación de <code>kernel.c</code>.</p>
+</div>
+
+<div class="card tip">
+  <h3>c) Puerto 80 → 18080</h3>
+  <p>El filtro TCP en <code>kernel.c</code>, el mensaje de arranque y el <code>hostfwd</code> de QEMU usan el puerto <strong>18080</strong>. En el script, <code>hostfwd=tcp::18080-:18080</code> reenvía el mismo puerto del Mac al guest.</p>
+</div>
+
+<h2 id="mac">10. Herramientas necesarias en macOS</h2>
+<table>
+  <tr><th>Herramienta</th><th>Para qué</th><th>Instalación</th></tr>
+  <tr><td><strong>Homebrew</strong></td><td>Gestor de paquetes. Lo usa el script si faltan herramientas.</td><td><code>/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"</code></td></tr>
+  <tr><td><strong>aarch64-elf-gcc</strong></td><td>Compilador cruzado de C para ARM64 bare-metal (sin libc).</td><td><code>brew install aarch64-elf-gcc</code></td></tr>
+  <tr><td><strong>aarch64-elf-binutils</strong></td><td>Ensamblador (<code>as</code>), enlazador (<code>ld</code>) y <code>objdump</code>/<code>nm</code>/<code>readelf</code> para inspeccionar el binario.</td><td><code>brew install aarch64-elf-binutils</code></td></tr>
+  <tr><td><strong>QEMU</strong></td><td>Emulador/virtualizador de la máquina <code>virt</code> de ARM.</td><td><code>brew install qemu</code></td></tr>
+  <tr><td><strong>curl</strong></td><td>Cliente HTTP para probar. Ya viene con macOS.</td><td>—</td></tr>
+  <tr><td><strong>python3</strong></td><td>Opcional: servidor de prueba para el upstream de <code>/remote</code> (<code>python3 -m http.server 9000</code>).</td><td>Ya viene con macOS (o <code>brew install python</code>).</td></tr>
+</table>
+<p>Las herramientas de cross-compilación se instalan con <code>brew install aarch64-elf-gcc aarch64-elf-binutils qemu</code>. El script <code>build_and_run.sh</code> hace esa comprobación automáticamente.</p>
+
+<h2 id="ejecucion">11. Ejecución: hypervisor (hvf) vs TCG</h2>
+<p>QEMU puede ejecutar el código ARM64 de dos formas. La diferencia afecta al rendimiento y a la depuración, pero no al código del unikernel.</p>
+
+<div class="grid">
+  <div class="card tip">
+    <h3>Hypervisor.framework (<code>-accel hvf</code>)</h3>
+    <p>Usa el hypervisor nativo de macOS. Las instrucciones del guest se ejecutan <strong>directamente en el procesador</strong> del Mac, sin traducir nada.</p>
+    <ul>
+      <li>Rápido en cómputo puro, cercano a velocidad nativa. En este servidor, sin embargo, no fue más rápido que TCG (ver sección 15).</li>
+      <li>Requiere un Mac con Apple Silicon (arm64) para ejecutar un guest arm64.</li>
+      <li>Se usa con <code>-cpu host</code> para exponer el procesador real.</li>
+      <li>Es el modo que elige el script cuando <code>uname -m</code> devuelve <code>arm64</code>.</li>
+      <li>En esta sesión no pude trazar excepciones con este modo: <code>-d int</code> no mostró nada útil. Por eso la depuración se hizo con TCG.</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h3>TCG (<code>-accel tcg</code>, por defecto)</h3>
+    <p>TCG (<em>Tiny Code Generator</em>) es el emulador de software de QEMU: <strong>traduce</strong> las instrucciones ARM64 a código para el host y las ejecuta.</p>
+    <ul>
+      <li>Funciona en cualquier Mac, incluidos los Intel, y en cualquier host.</li>
+      <li>Más lento en cómputo puro. En este servidor, en cambio, fue algo más rápido que hvf (ver sección 15).</li>
+      <li>Permite <code>-d int,guest_errors</code>, que muestra cada excepción con su <code>ESR</code>, <code>FAR</code> y <code>ELR</code>. Es la forma de encontrar fallos como los de la sección 9.</li>
+      <li>El script usa <code>-cpu cortex-a72</code> en este caso.</li>
+    </ul>
+  </div>
+</div>
+
+<h3>Comando equivalente en cada modo</h3>
+<pre><code># Apple Silicon: hypervisor nativo
+qemu-system-aarch64 -M virt -cpu host -accel hvf -m 128M \
+  -global virtio-mmio.force-legacy=on \
+  -netdev user,id=net0,hostfwd=tcp::18080-:18080 \
+  -device virtio-net-device,netdev=net0 \
+  -kernel unikernel_http.elf -nographic
+
+# Cualquier Mac: emulación TCG (y trazas de excepciones)
+qemu-system-aarch64 -M virt -cpu cortex-a72 -accel tcg -m 128M \
+  -global virtio-mmio.force-legacy=on \
+  -netdev user,id=net0,hostfwd=tcp::18080-:18080 \
+  -device virtio-net-device,netdev=net0 \
+  -kernel unikernel_http.elf -nographic -d int,guest_errors -D trace.log</code></pre>
+
+<h3>Significado de cada opción de QEMU</h3>
+<table>
+  <tr><th>Opción</th><th>Efecto</th></tr>
+  <tr><td><code>-M virt</code></td><td>Placa genérica ARM con las direcciones de la sección 4.</td></tr>
+  <tr><td><code>-cpu</code></td><td>Modelo de CPU. <code>host</code> solo con hvf; <code>cortex-a72</code> con TCG.</td></tr>
+  <tr><td><code>-accel</code></td><td>Motor de ejecución: <code>hvf</code> (hypervisor del Mac) o <code>tcg</code> (emulación por software).</td></tr>
+  <tr><td><code>-m 128M</code></td><td>Tamaño de RAM de la VM.</td></tr>
+  <tr><td><code>-global virtio-mmio.force-legacy=on</code></td><td>Fuerza el transporte VirtIO-MMIO versión 1, el que implementa el driver.</td></tr>
+  <tr><td><code>-netdev user,id=net0,hostfwd=…</code></td><td>Red SLIRP con reenvío del puerto 18080 del Mac al guest.</td></tr>
+  <tr><td><code>-device virtio-net-device,netdev=net0</code></td><td>Tarjeta de red VirtIO conectada al backend <code>net0</code>.</td></tr>
+  <tr><td><code>-kernel unikernel_http.elf</code></td><td>Carga el ELF en sus direcciones y salta a su entrada.</td></tr>
+  <tr><td><code>-nographic</code></td><td>Sin ventana; la UART PL011 se conecta a la terminal y <code>Ctrl+A</code> <code>X</code> sale de QEMU.</td></tr>
+  <tr><td><code>-d int,guest_errors -D trace.log</code></td><td>Solo TCG: registra excepciones en <code>trace.log</code>.</td></tr>
+</table>
+
+<div class="card warn">
+  <strong>Nota.</strong> En Apple Silicon, <code>-accel hvf</code> es la opción normal. Si una modificación del código falla solo en <code>hvf</code>, cambia a TCG para obtener la excepción exacta.
+</div>
+
+<h2 id="probar">12. Cómo ejecutarlo y probarlo</h2>
+<ol>
+  <li>Abre Terminal.app (o Warp si no te da problemas con SSH) y ve al proyecto:
+    <pre><code>cd ~/unikernel/unikernel_arm64_http</code></pre>
+  </li>
+  <li>Ejecuta el script. Compila, enlaza y arranca QEMU en primer plano:
+    <pre><code>./build_and_run.sh</code></pre>
+  </li>
+  <li>En <strong>otra terminal</strong> prueba la respuesta directa:
+    <pre><code>curl -i http://localhost:18080</code></pre>
+    Debes ver <code>HTTP/1.1 200 OK</code> y el HTML con el texto "Unikernel ARM64 Bare-Metal".
+  </li>
+  <li>Para probar <code>/remote</code>, arranca primero un servicio en el Mac en el puerto 9000 (QEMU lo alcanza como <code>10.0.2.2:9000</code>):
+    <pre><code>python3 -m http.server 9000 --bind 127.0.0.1</code></pre>
+    Después, en otra terminal:
+    <pre><code>curl -i http://localhost:18080/remote</code></pre>
+    Debes recibir el listado de ficheros del directorio donde arrancaste el servidor de Python.
+  </li>
+  <li>Para salir de QEMU: <strong>Ctrl+A</strong> y luego <strong>X</strong>.</li>
+</ol>
+
+<p>Si QEMU se ejecuta en segundo plano (como en la prueba de esta sesión), se detiene con:</p>
+<pre><code>pkill -f qemu-system-aarch64</code></pre>
+
+<h3>Lo que muestra la consola</h3>
+<pre><code>==================================================
+  UNIKERNEL ARM64 HTTP SERVER (BARE-METAL / MMIO)
+==================================================
+[NET] VirtIO-Net encontrado en 0x0A003E00
+[HTTP] Servidor escuchando en http://localhost:18080
+[INFO] Modo Poll-Mode activo (0 interrupciones).
+
+[HTTP] Peticion recibida -> Enviando respuesta 200 OK</code></pre>
+<p>Con <code>/remote</code> se añaden los logs de la sección 7.</p>
+
+<h2 id="problemas">13. Solución de problemas</h2>
+<table>
+  <tr><th>Síntoma</th><th>Causa probable</th><th>Qué hacer</th></tr>
+  <tr><td>Se queda tras <code>[NET] VirtIO-Net encontrado</code></td><td>Excepción no manejada (FP o alineación)</td><td>Ejecutar en TCG con <code>-d int,guest_errors</code> y leer <code>ESR</code>/<code>FAR</code>/<code>ELR</code>. Buscar la dirección <code>ELR</code> con <code>aarch64-elf-objdump -d unikernel_http.elf</code>.</td></tr>
+  <tr><td><code>curl</code> da timeout</td><td>Puerto distinto, o QEMU no está corriendo</td><td>Comprobar <code>lsof -nP -iTCP:18080 -sTCP:LISTEN</code>. Debe aparecer <code>qemu-system-aarch64</code>.</td></tr>
+  <tr><td><code>Address already in use</code></td><td>Otra instancia de QEMU ocupa 18080</td><td><code>pkill -f qemu-system-aarch64</code> y relanzar.</td></tr>
+  <tr><td><code>/remote</code> devuelve <code>504 Gateway Timeout</code></td><td>No hay ningún servicio escuchando en el Mac en el puerto 9000, o solo escucha en otra interfaz</td><td>Arrancar <code>python3 -m http.server 9000</code> en el Mac y repetir la prueba.</td></tr>
+  <tr><td><code>[OUT]</code> no llega a <code>resuelto por ARP</code></td><td>QEMU no está usando SLIRP o la red no es <code>-netdev user</code></td><td>Revisar que el comando incluye <code>-netdev user,id=net0</code> y <code>-device virtio-net-device,netdev=net0</code>.</td></tr>
+  <tr><td><code>No se encontro tarjeta VirtIO-Net</code></td><td>Falta <code>-device virtio-net-device</code> o la opción <code>force-legacy</code></td><td>Usar el comando completo de la sección 11.</td></tr>
+  <tr><td>Error de <code>aarch64-elf-gcc: command not found</code></td><td>Toolchain no instalado</td><td><code>brew install aarch64-elf-gcc aarch64-elf-binutils</code></td></tr>
+  <tr><td>Aviso <code>LOAD segment with RWX permissions</code></td><td>El enlazador no separa secciones de lectura/escritura/ejecución</td><td>Es solo un aviso; el binario funciona. Se puede corregir en <code>linker.ld</code> con segmentos separados.</td></tr>
+</table>
+
+<h2 id="pendiente">14. Pendiente</h2>
+<div class="card warn">
+  <strong>URL externa para <code>/remote</code>.</strong> Hoy el cliente saliente solo consulta <code>10.0.2.2:9000</code>, es decir, un servicio del Mac. El objetivo es que el unikernel consulte una URL externa y devuelva su contenido en <code>localhost:18080</code>. Para hacerlo hay que:
+  <ul>
+    <li>Elegir la URL. Solo puede ser <strong>HTTP plano</strong>: no hay TLS en el código.</li>
+    <li>Pasar la <strong>IP pública</strong> del destino: el unikernel no tiene DNS, así que un nombre de host hay que resolverlo antes y fijar la IP.</li>
+    <li>Parametrizar IP, puerto, ruta y cabecera <code>Host</code> en lugar de tenerlos fijos en <code>kernel.c</code>.</li>
+  </ul>
+</div>
+
+<h2 id="rendimiento">15. Rendimiento medido</h2>
+<p>Medido con <code>wrk</code> (<code>brew install wrk</code>) contra <code>http://localhost:18080</code>, con el mismo binario en ambos modos. Cada respuesta ocupa 175 bytes de cuerpo, unos 261 bytes con cabeceras.</p>
+
+<table>
+  <tr><th>Prueba</th><th>TCG</th><th>hvf</th></tr>
+  <tr><td>1 conexión, 10 s: req/s</td><td><strong>2.319</strong></td><td>1.906</td></tr>
+  <tr><td>1 conexión: latencia p50 / p99</td><td>323 µs / 543 µs</td><td>409 µs / 743 µs</td></tr>
+  <tr><td>4 conexiones, 5 s: req/s</td><td><strong>3.198</strong></td><td>2.193</td></tr>
+  <tr><td>4 conexiones: latencia p50 / p99</td><td>1,15 ms / 4,4 ms</td><td>1,62 ms / 9,2 ms</td></tr>
+  <tr><td>4 conexiones: errores de socket</td><td>38 lectura, 4 escritura (de 16.314)</td><td>19 lectura, 1 escritura (de 11.292)</td></tr>
+</table>
+
+<div class="card warn">
+  <strong>Lectura de los datos.</strong> En este servidor TCG resultó entre un 20 % y un 45 % más rápido que <code>hvf</code>, contra lo que cabría esperar, porque <code>hvf</code> ejecuta el código directamente en el procesador. La hipótesis es que el cuello de botella no es la CPU, sino los accesos MMIO de VirtIO y el bucle de polling: en <code>hvf</code> cada acceso obliga a salir al hypervisor, mientras que TCG lo resuelve dentro del emulador. <strong>Esta hipótesis no está comprobada</strong>; para verificarla haría falta contar los accesos MMIO por petición.
+</div>
+
+<div class="card warn">
+  <strong>Qué mide y qué no.</strong> La cifra incluye el loopback, el NAT de SLIRP de QEMU y el propio cliente <code>wrk</code> en el Mac, no solo el unikernel. Por eso la latencia de ~0,4 ms es mayor de lo que cabría esperar de un código tan simple. Los errores de socket con 4 conexiones varían entre ejecuciones y no son un dato fiable para comparar.
+</div>
+
+<div class="card warn">
+  <strong>Por qué no usar <code>ab</code>.</strong> <code>ab</code> reporta 19.936 req/s, pero es un resultado falso: cada petición tiene 0 bytes de respuesta y <code>Write errors: 5</code>. La pila TCP del unikernel no acepta el formato de petición que envía <code>ab</code>. <code>curl</code> y <code>wrk</code> sí obtienen <code>200 OK</code>.
+</div>
+
+<h3>Comandos usados</h3>
+<pre><code># Una conexión, 10 segundos, con distribución de latencias
+wrk -t1 -c1 -d10s --latency http://localhost:18080
+
+# Cuatro conexiones, 5 segundos
+wrk -t1 -c4 -d5s --latency http://localhost:18080</code></pre>
+
+<h2 id="notas">16. Limitaciones</h2>
+<ul>
+  <li>La red es un ejemplo didáctico: no implementa retransmisiones, ventanas TCP reales ni control de estado completo. Cada conexión saliente de <code>/remote</code> es única y sin reintentos.</li>
+  <li>El servidor sirve una sola respuesta fija; no hay parser HTTP ni rutas, salvo el disparador <code>GET /remote</code>.</li>
+  <li>El cliente saliente solo habla HTTP/1.1 plano, sin TLS, sin DNS y sin seguir redirecciones.</li>
+  <li>Todo el código corre en EL1 sin MMU; por eso la memoria se trata como <em>Device</em> y el alineamiento importa.</li>
+</ul>
+
+</main>
+</body>
+</html>
